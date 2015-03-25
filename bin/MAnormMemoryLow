@@ -1,0 +1,869 @@
+#!/usr/bin/env python
+"""
+main module of MAnorm, including all input and output of MAnorm, and all procedures are realized in this module.
+the order of methods:
+    set_2pks,
+        __classify_2pks_sets_by_overlap,
+        __overlap_in_random,
+    set_2rds,
+        __split_2rds_2_each_chr,
+        __calculate_the_peaks_rds_density,
+        __fit_model,
+    draw_figs_to_show_data,
+    output_pks_mvalue_2wig_file,
+    define_biased_pks,
+    define_unbiased_pks,
+    output_and_stat_MAnorm_values
+"""
+import os
+import sys
+import getopt
+import shutil
+
+from numpy import array, where, log10
+from statsmodels import api as sm
+import matplotlib as mpl
+
+from MAnormMemoryLow.MAValue import *
+from MAnormMemoryLow.Peak import Peak
+from MAnormMemoryLow.Reads import Reads
+
+# generate pics without tk
+mpl.use('Agg')
+from matplotlib import pyplot as plt
+
+
+class MAnorm:
+    """
+    a class including all MAnorm process
+    """
+
+    def __init__(self):
+        self.no_merging = False
+
+    def set_2pks(self, pk1_file_path, pk2_file_path, nsamp):
+
+        """
+        set 2 peak files path
+        @param nsamp: times of random overlap test
+        """
+        self.__pk1_file_path = pk1_file_path
+        self.__pk2_file_path = pk2_file_path
+        self.__classify_2_pks_sets_by_overlap()
+        self.__overlap_in_random(nsamp)
+
+    def __classify_2_pks_sets_by_overlap(self):
+        """
+        divide the peaks identified by 2 sets of ChIP-seq/genomewide array peaks into 3 group like:
+            A_uni, B_uni and A_B_com
+        """
+        pk1 = Peak.read_pk_file(self.__pk1_file_path)
+        print '%s: %d peaks' % (pk1.name, pk1.pk_num)
+        pk2 = Peak.read_pk_file(self.__pk2_file_path)
+        print '%s: %d peaks' % (pk2.name, pk2.pk_num)
+        self.__chr_id_list = list(set(pk1.chr_id + pk2.chr_id))
+        print 'classifying the 2 peaks sets by overlap: '
+
+        pk1_uni = Peak()
+        pk1_uni.name = pk1.name + '_unique_peaks'
+        pk1_com = Peak()
+        pk1_com.name = pk1.name + '_common_peaks'
+        pk2_uni = Peak()
+        pk2_uni.name = pk2.name + '_unique_peaks'
+        pk2_com = Peak()
+        pk2_com.name = pk2.name + '_common_peaks'
+
+        pk_12com = Peak()
+        pk_12com.name = pk1.name+ '_and_' + pk2.name + '_common_peaks'
+        summit2summit_dist = []
+
+        for chr_id in self.__chr_id_list:
+            pk1_chr = pk1.choose_one_chr_pks(chr_id)[0]
+            pk2_chr = pk2.choose_one_chr_pks(chr_id)[0]
+            response1 = np.ones(pk1_chr.pk_num)
+            response2 = np.ones(pk2_chr.pk_num)
+            for idx in xrange(pk1_chr.pk_num):
+                start = pk1_chr.start[idx]
+                end = pk1_chr.end[idx]
+                summit_dist = pk1_chr.summit[idx]
+                # find overlap peaks
+                claus = 1.0 * (end - array(pk2_chr.start)) * (array(pk2_chr.end) - start)
+                overlap_idxes = where(claus > 0)[0]
+                if overlap_idxes.size > 0:
+                    response1[idx] = 0
+                    response2[overlap_idxes] = 0
+
+            # get unique peaks
+            idxes1_uni = where(response1 == 1)[0]
+            idxes2_uni = where(response2 == 1)[0]
+            pk1_uni = pk1_uni.add(pk1_chr.choose_pks(idxes1_uni))
+            pk2_uni = pk2_uni.add(pk2_chr.choose_pks(idxes2_uni))
+
+            # get common peaks
+            idxes1_com = where(response1 == 0)[0]
+            idxes2_com = where(response2 == 0)[0]
+            pk1_com = pk1_com.add(pk1_chr.choose_pks(idxes1_com))
+            pk2_com = pk2_com.add(pk2_chr.choose_pks(idxes2_com))
+            pk1_chr_com = pk1_chr.choose_pks(idxes1_com)
+            pk2_chr_com = pk2_chr.choose_pks(idxes2_com)
+            if pk1_chr_com.pk_num > 0:
+                pk1_mark = np.ones(pk1_chr_com.pk_num).tolist()
+                pk2_mark = np.zeros(pk2_chr_com.pk_num).tolist()
+                pks_temp = pk1_chr_com.add(pk2_chr_com).sort_pks('start')
+                pks_mark = []
+                mark = pk1_mark + pk2_mark
+                idx_sort = array(pk1_chr_com.add(pk2_chr_com).start).argsort()
+                for i in idx_sort:
+                    pks_mark.append(mark[i])
+
+                pk_start = pks_temp.start[0]
+                pk_end = pks_temp.end[0]
+                j = 0
+                i = 1
+                while(i < pks_temp.pk_num):
+                    next_pk_start = pks_temp.start[i]
+                    next_pk_end = pks_temp.end[i]
+                    condition = 1.0 * (pk_end - next_pk_start) * (next_pk_end - pk_start)
+                    if condition > 0:
+                        pk_start = min(pk_start, next_pk_start)
+                        pk_end = max(pk_end, next_pk_end)
+                        i += 1
+                        if i == pks_temp.pk_num:
+                            pk_12com.chr_id.append(chr_id)
+                            pk_12com.start.append(pk_start)
+                            pk_12com.end.append(pk_end)
+                            idxes_this_peak = pks_mark[j:i]
+                            summit_this_peak = pks_temp.summit[j:i]
+                            idx_1 = np.where(array(idxes_this_peak) == 1)[0]
+                            idx_2 = np.where(array(idxes_this_peak) == 0)[0]
+                            summit_1 = array(summit_this_peak)[idx_1]
+                            summit_2 = array(summit_this_peak)[idx_2]
+                            summit_dist = abs(summit_1[0] - summit_2[0])
+                            summit = int(round((summit_1[0] + summit_2[0]) / 2))
+                            for s1 in summit_1:
+                                for s2 in summit_2:
+                                    if abs(s1 - s2) < summit_dist:
+                                        summit_dist = abs(s1 - s2)
+                                        summit = int(round((s1 + s2) / 2.0))
+                            summit2summit_dist.append(summit_dist)
+                            pk_12com.summit.append(summit)
+                            pk_12com.pk_num += 1
+                        continue
+                    else:
+                        pk_12com.chr_id.append(chr_id)
+                        pk_12com.start.append(pk_start)
+                        pk_12com.end.append(pk_end)
+                        idxes_this_peak = pks_mark[j:i]
+                        summit_this_peak = pks_temp.summit[j:i]
+                        idx_1 = np.where(array(idxes_this_peak) == 1)[0]
+                        idx_2 = np.where(array(idxes_this_peak) == 0)[0]
+                        summit_1 = array(summit_this_peak)[idx_1]
+                        summit_2 = array(summit_this_peak)[idx_2]
+                        summit_dist = abs(summit_1[0] - summit_2[0])
+                        summit = int(round((summit_1[0] + summit_2[0]) / 2))
+                        for s1 in summit_1:
+                            for s2 in summit_2:
+                                if abs(s1 - s2) < summit_dist:
+                                    summit_dist = abs(s1 - s2)
+                                    summit = int(round((s1 + s2) / 2.0))
+                        summit2summit_dist.append(summit_dist)
+                        pk_12com.summit.append(summit)
+                        pk_12com.pk_num += 1
+                        j = i
+                        pk_start = pks_temp.start[j]
+                        pk_end = pks_temp.end[j]
+
+        pk_12com.another_info.update({'summit2summit_dist': array(summit2summit_dist)})
+
+        print '%d %s' % (pk1_uni.pk_num, pk1_uni.name)
+        print '%d %s' % (pk2_uni.pk_num, pk2_uni.name)
+        print '%d %s' % (pk_12com.pk_num, pk_12com.name)
+
+        self.__pk1_uni = pk1_uni
+        self.__pk2_uni = pk2_uni
+        self.__pk_12com = pk_12com
+        if self.no_merging:
+            self.__pk1_com = pk1_com
+            self.__pk2_com = pk2_com
+            print '%d %s' % (pk1_com.pk_num, pk1_com.name)
+            print '%d %s' % (pk2_com.pk_num, pk2_com.name)
+
+    def __overlap_in_random(self, nsamp):
+        """
+        calculate the fold change relative to random permutations
+        @param nsamp: times of random overlap test
+        """
+        print 'calculating the fold change compare with random permutations: '
+        pk1 = Peak.read_pk_file(self.__pk1_file_path)
+        pk2 = Peak.read_pk_file(self.__pk2_file_path)
+        overlap_in_random = np.zeros(nsamp)
+        for ns in xrange(nsamp):
+            print 'random permutation test ' + str(ns + 1) + ' ...'
+            for chr_id in self.__chr_id_list:
+                # create random peaks
+                pk1_chr = pk1.choose_one_chr_pks(chr_id)[0]
+                pk2_chr = pk2.choose_one_chr_pks(chr_id)[0]
+                if pk1_chr.pk_num != 0 and pk2_chr.pk_num != 0:
+                # find overlap
+                    response1 = np.ones(pk1_chr.pk_num)
+                    response2 = np.ones(pk2_chr.pk_num)
+                    region_start = min(pk1_chr.start)
+                    region_end = max(pk1_chr.end)
+                    region_len = region_end - region_start
+                    rn = np.random.randint(0, region_len, pk1_chr.pk_num)
+                    start_rand = region_start + rn
+                    end_rand = start_rand + array(pk1_chr.end) - array(pk1_chr.start) + 1
+                    for idx in xrange(pk1_chr.pk_num):
+                        start = start_rand[idx]
+                        end = end_rand[idx]
+                        claus = 1.0 * (end - array(pk2_chr.start)) * (array(pk2_chr.end) - start)
+                        overlap_idxes =\
+                            where(1.0 * (end - array(pk2_chr.start)) * (array(pk2_chr.end) - start) > 0)[0]
+                        if overlap_idxes.size > 0:
+                            response1[idx] = 0
+                            response2[overlap_idxes] = 0
+                    idxes_rand_com = np.where(response1 == 0)[0]
+                    idxes2_com = np.where(response2 == 0)[0]
+                    if idxes_rand_com.size > 0:
+                        start_rand_com = start_rand[idxes_rand_com]
+                        end_rand_com = end_rand[idxes_rand_com]
+                        pk2_chr_com = pk2_chr.choose_pks(idxes2_com)
+                        start_all = start_rand_com.tolist() + pk2_chr_com.start
+                        end_all = end_rand_com.tolist() + pk2_chr_com.end
+                        start_all_sorted = []
+                        end_all_sorted = []
+                        idx_sort = array(start_all).argsort()
+                        for i in idx_sort.tolist():
+                            start_all_sorted.append(start_all[i])
+                            end_all_sorted.append(end_all[i])
+                        pk_start = start_all_sorted[0]
+                        pk_end = end_all_sorted[0]
+                        j = 0
+                        i = 1
+                        while(i < len(start_all_sorted)):
+                            next_pk_start = start_all_sorted[i]
+                            next_pk_end = end_all_sorted[i]
+                            condition = 1.0 * (pk_end - next_pk_start) * (next_pk_end - pk_start)
+                            if condition > 0:
+                                pk_start = min(pk_start, next_pk_start)
+                                pk_end = max(pk_end, next_pk_end)
+                                i += 1
+                                continue
+                            else:
+                                overlap_in_random[ns] += 1
+                                j = i
+                                pk_start = start_all_sorted[j]
+                                pk_end = end_all_sorted[j]
+
+        overlap_num_not_in_random = self.__pk_12com.pk_num
+        num_of_overlap_pks_in_random =  str(overlap_in_random.mean()) + ' +/- ' + str(overlap_in_random.std())
+        fold_change_in_random = str(overlap_num_not_in_random / overlap_in_random.mean())
+
+        print 'In random permutations, overlapping peaks: ' + num_of_overlap_pks_in_random
+        print 'Fold change: ' + fold_change_in_random
+
+    def set_2rds(self, rds1_file_path,
+                 tag1_shift,
+                 tag1_len,
+                 rds2_file_path,
+                 tag2_shift,
+                 tag2_len,
+                 ext,
+                 max_s2s_dist,
+                 output_dir):
+        """
+        set 2 reads files path
+        @param ext:
+            2*extention = the window size to calculate reads density; we recommend extention=1000 for
+            histone modification, extention=500 for transcription factor.
+        @param max_s2s_dist:
+            this value used for merging common peaks
+        """
+        self.__rds1_file_path = rds1_file_path
+        self.__rds2_file_path = rds2_file_path
+        self.__mk1_name = os.path.basename(rds1_file_path)[:-4]
+        self.__mk2_name = os.path.basename(rds2_file_path)[:-4]
+        self.__split_2rds_2_each_chr(output_dir)
+        self.__calculate_the_peaks_rds_density(ext, tag1_shift, tag1_len, tag2_shift, tag2_len, output_dir)
+        self.__fit_model(self.__pk_12com, max_s2s_dist)
+
+    def __split_2rds_2_each_chr(self, output_dir):
+        """
+        this method is used to split the sequencing data in txt format into separate files,
+        of which each file is of ALN format and only contains the sequencing data on one chromosome.
+        """
+        print 'splitting reads data 1 into each chromosome files ...'
+        Reads.split_rds_by_chr(self.__rds1_file_path, self.__chr_id_list, output_dir)
+        print 'splitting reads data 2 into each chromosome files ...'
+        Reads.split_rds_by_chr(self.__rds2_file_path, self.__chr_id_list, output_dir)
+
+    def __calculate_the_peaks_rds_density(self, ext, tag1_shift, tag1_len, tag2_shift, tag2_len, output_dir):
+        """
+        calculate peak reads density
+        """
+        print 'calculating peaks reads density: '
+        pks = [self.__pk1_uni, self.__pk2_uni, self.__pk_12com]
+        if self.no_merging:
+            pks.append(self.__pk1_com)
+            pks.append(self.__pk2_com)
+        for pk in pks:
+            pk.cal_rds_density(self.__mk1_name, ext, tag1_shift, tag1_len, output_dir)
+            pk.cal_rds_density(self.__mk2_name, ext, tag2_shift, tag2_len, output_dir)
+
+        shutil.rmtree(os.sep.join([output_dir, 'split_rds_data']))
+
+    def __fit_model(self, pk_12com, max_s2s_dist):
+        """
+        using matched common peaks to fit model
+        @param max_s2s_dist:
+            the selected common peaks much have summit-to-summit distance smaller than this value to
+            as matched common peaks; suggest to be half of extention.
+        """
+        print 'fitting common peaks: '
+        choosed_com_pks = where(pk_12com.another_info['summit2summit_dist'] < max_s2s_dist)[0]
+        pk_12com_choosed = pk_12com.choose_pks(choosed_com_pks)
+        mvalue, avalue = cal_mavalue(pk_12com_choosed, self.__mk1_name, self.__mk2_name)
+        fit_x = avalue
+        fit_y = mvalue
+        idx_sel = where((fit_y >= -10) & (fit_y <= 10))[0]
+
+        # fit the model
+        x = sm.add_constant(fit_x[idx_sel])
+        y = fit_y[idx_sel]
+        ma_fit = sm.RLM(y, x).fit().params
+
+        # --------limushan------------
+        # from least_absolute import least_absolute
+        # x = fit_x[idx_sel].tolist()
+        # y = fit_y[idx_sel].tolist()
+        # a, b = least_absolute(x, y)
+        # ma_fit = [b, a]
+        # ----------------------------
+
+        self.__ma_fit = ma_fit
+        if ma_fit[0] >= 0:
+            print 'Model for normalization: M = %f * A + %f' % (ma_fit[1], ma_fit[0])
+        else:
+            print 'Model for normalization: M = %f * A - %f' % (ma_fit[1], abs(ma_fit[0]))
+
+    def draw_figs_to_show_data(self, dir_2save):
+        """
+        draw four figures to show data before and after rescaled
+        @param dir_2save: direcotry to save figures
+        """
+        dir_2save += os.sep + 'output_figures'
+        if not os.path.exists(dir_2save):
+            os.makedirs(dir_2save)
+
+        pks = [self.__pk1_uni, self.__pk2_uni, self.__pk_12com]
+        colors = 'bgr'
+        # plot before scale
+        a_max = 0
+        a_min = 10000
+        plt.figure(1).set_size_inches(16, 12)
+        legend_names = []
+        for (idx, pk) in enumerate(pks):
+            mvalue, avalue = cal_mavalue(pk, self.__mk1_name, self.__mk2_name)
+            if avalue.size != 0:
+                a_max = max(avalue.max(), a_max)
+                a_min = min(avalue.min(), a_min)
+            plt.scatter(avalue, mvalue, s=10, c=colors[idx])
+            legend_names.append(pk.name)
+        plt.xlabel('A value')
+        plt.ylabel('M value')
+        plt.grid(axis='y')
+        plt.legend(array(legend_names), loc='best')
+        plt.title('before rescale')
+
+        # plot the fitting model into figure 1
+        ma_fit = self.__ma_fit
+        x = np.arange(a_min, a_max, 0.01)
+        y = ma_fit[1] * x + ma_fit[0]
+        plt.plot(x, y, '-', color='k')
+        plt.savefig(dir_2save + os.sep + 'before_rescale.png')
+
+        # plot the scatter plots of read count in common peaks between two
+        # chip-seq sets
+        plt.figure(2).set_size_inches(16, 12)
+        rd_min = 1000
+        rd_max = 0
+        mks_name = [self.__mk1_name, self.__mk2_name]
+        pk_com = self.__pk_12com
+        rds_density1 = pk_com.rds_density[mks_name[0]]
+        rds_density2 = pk_com.rds_density[mks_name[1]]
+        rd_max = max(max(np.log2(rds_density1 + 1)), rd_max)
+        rd_min = min(min(np.log2(rds_density1 + 1)), rd_min)
+        plt.scatter(np.log2(rds_density1), np.log2(rds_density2), s=10, c='r', label=pk_com.name, alpha=0.5)
+        plt.xlabel(' log2 read density' + ' by ' +  '"' + self.__mk1_name.replace('_', ' ') + '" reads')
+        plt.ylabel(' log2 read density' + ' by ' + '"' + self.__mk2_name.replace('_', ' ') + '" reads')
+        plt.grid(axis='y')
+        plt.legend(loc='upper left')
+        plt.title('Fitting Model via common peaks')
+        rx = np.arange(rd_min, rd_max, 0.01)
+        ry = (2 - ma_fit[1]) * rx / (2 + ma_fit[1]) - 2 * ma_fit[0] / (2 + ma_fit[1])
+        plt.plot(rx, ry, '-', color='k')
+        plt.savefig(dir_2save + os.sep + 'log2_read_density.png')
+
+        # plot the MA plot after rescale
+        plt.figure(3).set_size_inches(16, 12)
+        legend_names = []
+        for (idx, pk) in enumerate(pks):
+            mapvalue = cal_mapvalue_rescaled(pk, self.__mk1_name, self.__mk2_name, ma_fit)
+            plt.scatter(mapvalue[1], mapvalue[0], s=10, c=colors[idx])
+            legend_names.append(pk.name)
+        plt.xlabel('A value')
+        plt.ylabel('M value')
+        plt.grid(axis='y')
+        plt.legend(array(legend_names), loc='best')
+        plt.title('after rescale')
+        plt.savefig(dir_2save + os.sep + 'after_rescale.png')
+
+        # generate MA plot for this set of peaks together with p-value
+        plt.figure(4).set_size_inches(16, 12)
+        for (idx, pk) in enumerate(pks):
+            colors = -log10(pk.another_info['MAnorm_pvalue'])
+            for i, c in enumerate(colors):
+                if c > 50:
+                    colors[i] = 50
+            plt.scatter(pk.another_info['MAnorm_avalue'], pk.another_info['MAnorm_mvalue'], s=10, c=colors, cmap='jet')
+        plt.colorbar()
+        plt.grid(axis='y')
+        plt.xlabel('A value')
+        plt.ylabel('M value')
+        plt.title('-log10(P-value)')
+        plt.savefig(os.sep.join([dir_2save, '-log10_P-value.png']))
+        plt.close()
+
+    def output_pks_mvalue_2wig_file(self, dir_2save, MAnorm_name):
+        """
+        out put of peaks with M Value
+        @param MAnorm_name: the folder name to save all output files
+        """
+        dir_2save += os.sep + 'output_wig_files'
+        if not os.path.exists(dir_2save):
+            os.makedirs(dir_2save)
+        print 'output wig files ... '
+
+        pk = self.__pk1_uni.add(self.__pk_12com).add(self.__pk2_uni)
+
+        pk.name = MAnorm_name + '_merged_peaks_Mvalue'
+        f_2write = open(dir_2save + os.sep + pk.name + '.wig', 'w')
+        f_2write.write('browser position chr11:5220000-5330000\n')
+        f_2write.write('track type=wiggle_0 name=%s' % pk.name +
+                       ' visibility=full autoScale=on color=255,0,0 ' +
+                       ' yLineMark=0 yLineOnOff=on priority=10\n')
+        chr_id_list = list(set(pk.chr_id))
+        for chr_id in chr_id_list:
+            f_2write.write('variableStep chrom=' + chr_id + ' span=100\n')
+            pk_chr = pk.choose_one_chr_pks(chr_id)[0]
+            sorted_pk_chr = pk_chr.sort_pks('summit')
+            # write sorted peak summit and m-value to file
+            for i in xrange(sorted_pk_chr.pk_num):
+                f_2write.write(
+                    str(sorted_pk_chr.summit[i]) + '\t' +
+                    str(sorted_pk_chr.another_info['MAnorm_mvalue'][i]) +
+                    '\n')
+        f_2write.close()
+
+        pk.name = MAnorm_name + '_merged_peaks_Pvalue'
+        f_2write = open(dir_2save + os.sep + pk.name + '.wig', 'w')
+        f_2write.write('browser position chr11:5220000-5330000\n')
+        f_2write.write('track type=wiggle_0 name=%s(-log10(p-value))' % pk.name +
+                       ' visibility=full autoScale=on color=255,0,0 ' +
+                       ' yLineMark=0 yLineOnOff=on priority=10\n')
+        chr_id_list = list(set(pk.chr_id))
+        for chr_id in chr_id_list:
+            f_2write.write('variableStep chrom=' + chr_id + ' span=100\n')
+            pk_chr = pk.choose_one_chr_pks(chr_id)[0]
+            sorted_pk_chr = pk_chr.sort_pks('summit')
+            # write sorted peak summit and p-value to file
+            for i in xrange(sorted_pk_chr.pk_num):
+                f_2write.write(
+                    '\t'.join([str(sorted_pk_chr.summit[i]),
+                               str(-log10(sorted_pk_chr.another_info['MAnorm_pvalue'][i]))]) + '\n')
+        f_2write.close()
+
+    def define_biased_pks(self, mcut_biased, pcut_biased, overlap_dependent, dir_2save):
+        """
+        cut peaks by defining biasd value.
+        @param mcut_biased:
+            Cutoff of M value cutoff to define biased peaks between 2 samples:
+        @param pcut_biased:
+            Cutoff of P value (of differential binding) cutoff to define biased
+            peaks between 2 samples;
+            Sample 1-specific binding regions: all peaks associated with
+            M>=Mcut_biased and P<Pcut_biased;
+            Sample 2-specific binding regions: all peaks associated with
+            M<=-Mcut_biased and P<Pcut_biased;.
+        @param overlap_dependent:
+            in overlap dependent, will cut peaks in unique and common peaks
+        """
+        dir_2save += os.sep + 'output_filters'
+        if not os.path.exists(dir_2save):
+            os.makedirs(dir_2save)
+        print 'define biased peaks: '
+
+        if not overlap_dependent:
+            pks = self.__pk1_uni.add(self.__pk_12com).add(self.__pk2_uni)
+            pks.name = '3set_peaks'
+            idxes_cut_11 = where(pks.another_info['MAnorm_mvalue'] >= mcut_biased)[0]
+            idxes_cut_12 = where(pks.another_info['MAnorm_mvalue'] <= -mcut_biased)[0]
+            idxes_cut_2 = where(pks.another_info['MAnorm_pvalue'] < pcut_biased)[0]
+            idxes_cut1 = np.intersect1d(idxes_cut_11, idxes_cut_2)
+            idxes_cut2 = np.intersect1d(idxes_cut_12, idxes_cut_2)
+            pk1, pk2 = pks.choose_pks(idxes_cut1), pks.choose_pks(idxes_cut2)
+            pk1.name = 'M over %f biased peaks' % mcut_biased
+            pk2.name = 'M less -%f biased peaks' % mcut_biased
+            for pk_cut in [pk1, pk2]:
+                print str(pk_cut.pk_num) + ' are filtered from ' + pks.name
+                file_bed = open(dir_2save + os.sep + pk_cut.name.replace(' ', '_') + '.bed', 'w')
+                for idx in xrange(pk_cut.pk_num):
+                    line = \
+                        '\t'.join([pk_cut.chr_id[idx], str(pk_cut.start[idx]), str(pk_cut.end[idx]),
+                                   'From_' + pks.name + str(idx), str(pk_cut.another_info['MAnorm_mvalue'][idx])]) + '\n'
+                    file_bed.write(line)
+                file_bed.close()
+        else:
+            pks = [self.__pk1_uni, self.__pk2_uni]
+
+            for i, pk in enumerate(pks):
+                idxes_cut_1 = None
+                if i == 0:
+                    idxes_cut_1 = where(pk.another_info['MAnorm_mvalue'] >= mcut_biased)[0]
+                elif i == 1:
+                    idxes_cut_1 = where(pk.another_info['MAnorm_mvalue'] <= -mcut_biased)[0]
+                # else:
+                #     idxes_cut_1 = where(abs(pk.another_info['MAnorm_mvalue']) >= mcut_biased)[0]
+                idxes_cut2 = where(pk.another_info['MAnorm_pvalue'] < pcut_biased)[0]
+                idxes_cut = np.intersect1d(idxes_cut_1, idxes_cut2)
+                pk_cut = pk.choose_pks(idxes_cut)
+                pk_cut.name = 'biased peaks of ' + pk_cut.name
+                print str(pk_cut.pk_num) + ' are filtered from ' + pk.name
+
+                file_bed = open(dir_2save + os.sep + pk_cut.name.replace(' ', '_') + '.bed', 'w')
+                for idx in xrange(pk_cut.pk_num):
+                    line = \
+                        '\t'.join([pk_cut.chr_id[idx], str(pk_cut.start[idx]), str(pk_cut.end[idx]),
+                                   'From_' + pk.name + str(idx), str(pk_cut.another_info['MAnorm_mvalue'][idx])]) + '\n'
+                    file_bed.write(line)
+                file_bed.close()
+
+    def define_unbiased_pks(self, mcut_unbiased, overlap_dependent, dir_2save):
+        """
+        cut peaks by defining unbiasd value.
+        @param mcut_unbiased:
+            Cutoff of |M| value to define unbiased peaks between 2 samples.
+            here M value is the log2 fold change at peak region between two
+            samples, value 1 means fold change 2.
+            Non-cell type-specific binding regions: all peaks associated with
+            |M|<Mcut_unbiased
+        @param overlap_dependent:
+            in overlap dependent, will cut peaks in unique and common peaks
+        """
+        dir_2save += os.sep + 'output_filters'
+        if not os.path.exists(dir_2save):
+            os.makedirs(dir_2save)
+        print 'define unbiased peaks: '
+
+        if not overlap_dependent:
+            pks = self.__pk1_uni.add(self.__pk_12com).add(self.__pk2_uni)
+            pks.name = 'all_peaks'
+        else:
+            pks = self.__pk_12com
+
+        i_cut = where(abs(pks.another_info['MAnorm_mvalue']) < mcut_unbiased)[0]
+        pk_mcut = pks.choose_pks(i_cut)
+        pk_mcut.name = 'unbiased peaks of '+ pks.name
+        print str(pk_mcut.pk_num) + ' are filtered from merged ' + pks.name
+        mval_re_mcut = pks.another_info['MAnorm_mvalue'][i_cut]
+
+        file_bed = open(dir_2save + os.sep + pk_mcut.name.replace(' ', '_') + '.bed', 'w')
+        for idx in xrange(pk_mcut.pk_num):
+            line = \
+                '\t'.join([pk_mcut.chr_id[idx], str(pk_mcut.start[idx]), str(pk_mcut.end[idx]),
+                           'From_' + pks.name.replace(' ', '_') + str(idx), str(mval_re_mcut[idx])]) + '\n'
+            file_bed.write(line)
+
+    def output_and_stat_MAnorm_values(self, dir2save, MAnorm_name):
+        """
+        MAnorm value is calculated after drawing pictures and defining biased
+        and unbiased peaks
+        @param MAnorm_name: folder name for saving all ouput files.
+        """
+        print 'output MAnorm values to xls files ...'
+        if not os.path.exists(dir2save):
+            os.makedirs(dir2save)
+
+        f = open(os.sep.join([dir2save, MAnorm_name + '_all_peak_MAvalues.xls']), 'w')
+        header = \
+            '\t'.join(['#chr', 'start', 'end', 'summit',
+                       'MAnorm_Mvalue', 'MAnorm_Avalue', 'MAnorm_Pvalue', 'common_or_unique']) + '\n'
+        f.write(header)
+
+        fig = plt.figure()
+        fig.set_size_inches(16, 12)
+        colors = 'brg'
+        fignum = 1
+        ic = 0
+        pks = [self.__pk1_uni, self.__pk_12com, self.__pk2_uni]
+        coru = [self.__pk1_uni.name.replace('_peaks', ''),
+                '%s_and_%s_common' %
+                (self.__pk1_uni.name.replace('_unique_peaks', ''), self.__pk2_uni.name.replace('_unique_peaks', '')),
+                self.__pk2_uni.name.replace('_peaks', '')]
+        k = 0
+        for pk in pks:
+            mvalue_re = pk.another_info['MAnorm_mvalue']
+            avalue_re = pk.another_info['MAnorm_avalue']
+            pvalue = pk.another_info['MAnorm_pvalue']
+            for i in range(pk.pk_num):
+                line = \
+                    '\t'.join([pk.chr_id[i], str(pk.start[i]), str(pk.end[i]), str(pk.summit[i] - pk.start[i]),
+                               str(mvalue_re[i]), str(avalue_re[i]), str(pvalue[i]), coru[k]]) + '\n'
+                f.write(line)
+            k += 1
+            color = colors[ic]
+            ic += 1
+            for mp, val in enumerate([[mvalue_re, 'MAnorm_mvalue'], [-log10(pvalue), '-log10(pvalue)']]):
+                ax = fig.add_subplot(len(pks), 2, fignum)
+                if mp == 0:
+                    ax.hist(val[0], color=color, bins=30)
+                if mp == 1:
+                    ax.hist(val[0], color=color, bins=30, range=(0, 15))
+                if fignum % 2 == 0:
+                    ax.legend(array([pk.name]), loc='best', prop={'size': 8})
+                if fignum % 2 == 1:
+                    ax.set_ylabel('Peak Count')
+                    ax.legend(array(['Number of peaks: ' + str(pk.pk_num)]), prop={'size': 8})
+                if fignum == (len(pks) * 2 - 1) or fignum == len(pks) * 2:
+                    ax.set_xlabel(val[1])
+                fignum +=1
+        f.close()
+        fig.savefig(os.sep.join([dir2save, 'output_figures', 'peaks_summary.png']))
+        plt.close()
+
+        if self.no_merging:
+            cal_mavalue(self.__pk1_com, self.__mk1_name, self.__mk2_name)
+            cal_mavalue(self.__pk2_com, self.__mk1_name, self.__mk2_name)
+            cal_mapvalue_rescaled(self.__pk1_com, self.__mk1_name, self.__mk2_name, self.__ma_fit)
+            cal_mapvalue_rescaled(self.__pk2_com, self.__mk1_name, self.__mk2_name, self.__ma_fit)
+            pk1 = self.__pk1_uni.add(self.__pk1_com)
+            pk1.name = pk1.name.replace('_unique', '')
+            pk2 = self.__pk2_uni.add(self.__pk2_com)
+            pk2.name = pk2.name.replace('_unique', '')
+
+            for pk, u in zip([pk1, pk2], [self.__pk1_uni.pk_num, self.__pk2_uni.pk_num]):
+                f = open(dir2save + os.sep + pk.name.strip().replace(' ', '_').replace('peaks', 'peak_MAvalues') +
+                         '.xls', 'w')
+                mvalue_re = pk.another_info['MAnorm_mvalue']
+                avalue_re = pk.another_info['MAnorm_avalue']
+                pvalue = pk.another_info['MAnorm_pvalue']
+                f.write(
+                    '\t'.join(['#chr', 'start', 'end', 'summit', 'MAnorm_Mvalue', 'MAnorm_Avalue', 'MAnorm_Pvalue',
+                               'common_or_unique']) + '\n')
+                for i in range(pk.pk_num):
+                    if i < u:
+                        line = \
+                            '\t'.join([pk.chr_id[i], str(pk.start[i]), str(pk.end[i]), str(pk.summit[i] - pk.start[i]),
+                                       str(mvalue_re[i]), str(avalue_re[i]), str(pvalue[i]), 'unique']) + '\n'
+                    else:
+                        line = \
+                            '\t'.join([pk.chr_id[i], str(pk.start[i]), str(pk.end[i]), str(pk.summit[i] - pk.start[i]),
+                                       str(mvalue_re[i]), str(avalue_re[i]), str(pvalue[i]), 'common']) + '\n'
+                    f.write(line)
+                f.close()
+
+
+def usage():
+    """
+    help information
+    """
+    print 'Usage: MAnorm <--p1 peak1file> <--r1 reads1file> <--p2 peak2file>\n'\
+          '              <--r2 reads2file> [options]\n' \
+          '\n' \
+          'MAnorm: a robust model for quantitative comparison of ChIP-Seq data sets\n' \
+          '\n' \
+          'options:\n' \
+          '  -h, --help                 show help information.\n' \
+          '  --p1, --peak1              name of text-delimited file containing peak,\n' \
+          '                             information of sample 1. It should contain\n' \
+          '                             at least three columns, which are chromosome\n' \
+          '                             name, start and end position of each peak.\n' \
+          '                             If the fourth column exists, it should be\n' \
+          '                             summit position (relative to peak start).\n' \
+          '                             Otherwise, MAnorm will use the center of\n' \
+          '                             peaks instead.\n' \
+          '  --r1, --reads1             name of the text-delimited file containing\n' \
+          '                             raw read information of sample 1. It should\n' \
+          '                             be of bed format, in which the first, second,\n'\
+          '                             third and sixth columns are the chromosome,\n' \
+          '                             start, end and strand, respectively.\n' \
+          '  --s1, --tag1_shift         read shift size of sample 1, which should be\n' \
+          '                             set as the average size of DNA fragments,\n' \
+          '                             default=100.\n' \
+          '  --l1, -tag1_len            read length of sample 1, default=50.\n' \
+          '  --p2, --peak2              name of the text-delimited file containing\n' \
+          '  --r2, -reads2              name of the text-delimited file containing\n' \
+          '  --s2, --tag2_shift         read shift size of sample 2, default=100.\n' \
+          '  --l2, --tag2_len           read length of sample 2, default=50.\n' \
+          '  -n, --random_test          number of random permutations to test the\n' \
+          '                             enrichment of overlapping between two peak\n' \
+          '                             sets, default=5.\n' \
+          '  -e, --extension            default=1000, 2*extension=size of the\n' \
+          '                             window centered at peak summit to calculate\n' \
+          '                             reads density. The window size should match\n' \
+          '                             the typical length of peaks, thus we\n' \
+          '                             recommend extension=1000 for sharp histone\n' \
+          '                             marks like H3K4me2/3 or H3K9/27ac, \n' \
+          '                             extension=500 for transcription factor or\n' \
+          '                             DNase-seq.\n' \
+          '  -d, --summit2summit_dist   summit to summit distance cutoff,\n' \
+          '                             default=extension/2. Only those common\n' \
+          '                             peaks with distance between their summits in\n' \
+          '                             2 samples smaller than this value will be\n' \
+          '                             considered as real common peaks for building\n' \
+          '                             the normalization model.\n' \
+          '  -o, --output               Name of this comparison, which will be also\n' \
+          '                             used as the name of folder created to store\n' \
+          '                             all output files, default is "MAnorm_pair".\n' \
+          '  -v, --overlap_dependent    if this option is used, MAnorm will choose biased\n' \
+          '                             peaks only from unique peaks, and choose unbiased\n' \
+          '                             peaks only from common peaks. But if this\n' \
+          '                             option is not used, MAnorm will choose biased\n' \
+          '                             and unbiased peaks just based on the M-value\n' \
+          '                             and P-value cutoffs, without checking whether\n' \
+          '                             they are common or unique peaks.\n'\
+          '  -s, --no_merging           By default, MAnorm will first separate both\n' \
+          '                             sets of input peaks into common and unique\n' \
+          '                             peaks, by checking whether they have overlap\n' \
+          '                             with any peak in the other sample, and then\n' \
+          '                             merge the 2 sets of common peaks into 1 group\n' \
+          '                             of non-overlapping ones. But if this option\n' \
+          '                             is used, MAnorm would not merge the common\n' \
+          '                             peaks and the peaks in output files will be\n' \
+          '                             exactly the same as those from input.\n'\
+          '  -p, --pcut_biased          Cutoff of P-value to define biased\n'\
+          '                             (high-confidence sample 1 or 2-specific)\n' \
+          '                             peaks, default=0.01.\n'\
+          '  -m, --mcut_biased          Cutoff of M-value to define biased peaks,\n'\
+          '                             default=1. Sample 1 biased peaks are defined\n' \
+          '                             as sample 1 unique peaks with M-value > \n' \
+          '                             mcut_biased and P-value < pcut_biased, while\n' \
+          '                             sample 2 biased peaks are defined as sample\n' \
+          '                             2 unique peaks with M-value < -1*mcut_biased\n' \
+          '                             and P-value < pcut_biased.\n' \
+          '  -u, --mcut_unbiased        Cutoff of M-value to define unbiased\n'\
+          '                             (high-confidence non-specific) peaks\n'\
+          '                             between 2 samples, default=1. They are\n'\
+          '                             defined to be the common peaks with\n'\
+          '                             -1*mcut_unbiased < M-value < mcut_unbiased\n'\
+          '                             and P-value > pcut_biased.\n'
+
+
+def main():
+    """
+    method to enter MAnorm process
+    """
+    pk1_file_path, rds1_file_path = '', ''
+    tag1_shift, tag1_len = 100, 50
+
+    pk2_file_path, rds2_file_path = '', ''
+    tag2_shift, tag2_len = 100, 50
+
+    nsamp = 5
+    ext = 1000
+    max_s2s_dist = ext / 2
+
+    overlap_dependent = False
+    output_2sample_MAvalue = False
+    mcut_unbiased = 1
+    mcut_biased, pcut_biased = 1, 0.01
+
+    output_dir = os.getcwd() + os.sep + 'MAnorm_pair'
+    MAnorm_name = 'MAnorm_pair'
+
+    options = ['p1=', 'r1=', 's1=', 'l1=',
+               'p2=', 'r2=', 's2=', 'l2=',
+               'peak1=', 'reads1=', 'tag1_shift=', 'tag1_len=',
+               'peak2=', 'reads2=', 'tag2_shift=', 'tag2_len=',
+               'help', 'pcut_biased=', 'mcut_biased=', 'mcut_unbiased=',
+               'random_test=', 'extension=', 'summit2summit_dist=',
+               'output=', 'overlap_independent', 'no_merging']
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], "d:n:e:o:p:m:u:hvs", options)
+        for o, a in opts:
+            if o in ('-h', '--help'):
+                usage()
+                sys.exit()
+
+            if o in ('--p1', '--peak1'):
+                if a in os.listdir(os.getcwd()):
+                    pk1_file_path = os.getcwd() + os.sep + a
+                else:
+                    pk1_file_path = a
+            if o in ('--r1', '--reads1'):
+                if a in os.listdir(os.getcwd()):
+                    rds1_file_path = os.getcwd() + os.sep + a
+                else:
+                    rds1_file_path = a
+            if o in ('--s1', '--tag1_shift'):
+                tag1_shift = int(a)
+            if o in ('--l1', '--tag1_len'):
+                tag1_len = int(a)
+
+            if o in ('--p2', '--peak2'):
+                if a in os.listdir(os.getcwd()):
+                    pk2_file_path = os.getcwd() + os.sep + a
+                else:
+                    pk2_file_path = a
+            if o in ('--r2', '--reads2'):
+                if a in os.listdir(os.getcwd()):
+                    rds2_file_path = os.getcwd() + os.sep + a
+                else:
+                    rds2_file_path = a
+            if o in ('--s2', '--tag2_shift'):
+                tag2_shift = int(a)
+            if o in ('--l2', '--tag2_len'):
+                tag2_len = int(a)
+
+            if o in ('-d', '--summit2summit_dist'):
+                max_s2s_dist = int(a)
+            if o in ('-n', '--random_test'):
+                nsamp = int(a)
+            if o in ('-e', '--extension'):
+                ext = int(a)
+            if o in ('-o', '--output'):
+                output_dir = os.getcwd() + os.sep + a
+                MAnorm_name = a
+
+            if o in ('-v', '--overlap_dependent'):
+                overlap_dependent = True
+            if o in ('-s', '--no_merging'):
+                output_2sample_MAvalue = True
+            if o in ('-p', '--pcut_biased'):
+                pcut_biased = float(a)
+            if o in ('-m', '--mcut_biased'):
+                mcut_biased = float(a)
+            if o in ('-u', '--mcut_unbiased'):
+                mcut_unbiased = float(a)
+
+    except getopt.GetoptError:
+        print 'error in getting parameters!'
+        sys.exit()
+
+    ma = MAnorm()
+    ma.no_merging = output_2sample_MAvalue
+    ma.set_2pks(pk1_file_path, pk2_file_path, nsamp)
+    ma.set_2rds(rds1_file_path, tag1_shift, tag1_len,
+                rds2_file_path, tag2_shift, tag2_len,
+                ext, max_s2s_dist, output_dir)
+    ma.draw_figs_to_show_data(output_dir)
+    ma.output_pks_mvalue_2wig_file(output_dir, MAnorm_name)
+    ma.define_biased_pks(mcut_biased, pcut_biased, overlap_dependent, output_dir)
+    ma.define_unbiased_pks(mcut_unbiased, overlap_dependent, output_dir)
+    ma.output_and_stat_MAnorm_values(output_dir, MAnorm_name)
+
+    print 'Finished!\n'
+
+
+if __name__ == '__main__':
+    main()
