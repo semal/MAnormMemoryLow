@@ -5,6 +5,7 @@
 **Input:**
 
 There are four input files needed, 2 peaks files and 2 reads files:
+
     python MAnorm.py --p1 peak1 --r1 read1 --p2 peak2 --r2 read1
 
 > **Note:**peak file support bed format and macs output xls format. The first three columns 
